@@ -94,11 +94,22 @@ jobs:
       - name: Verify routes
         run: |
           set -e
-          for u in hub.asepharyana.my.id scraper.asepharyana.my.id tools.asepharyana.my.id wiki.asepharyana.my.id upload.asepharyana.my.id ai.asepharyana.my.id; do
-            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://$u/" || true)
-            echo "$u -> $code"
+          # host:path — probe the path that actually exists instead of "/".
+          # Scraper deliberately has no root route (404 by design) so "/" is a
+          # false failure; tools/ and ai. are gone from the stack entirely.
+          routes=(
+            "hub.asepharyana.my.id:/"
+            "wiki.asepharyana.my.id:/"
+            "wiki.asepharyana.my.id:/health"
+            "scraper.asepharyana.my.id:/health"
+            "upload.asepharyana.my.id:/"
+          )
+          for r in "${routes[@]}"; do
+            u=${r%%:*}; p=${r#*:}
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://$u$p" || true)
+            echo "$u$p -> $code"
             case "$code" in
-              000|502|503|504) echo "::error::$u bad status $code"; exit 1 ;;
+              000|502|503|504) echo "::error::$u$p bad status $code"; exit 1 ;;
             esac
           done
           echo "✅ All routes reachable"

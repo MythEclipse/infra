@@ -36,5 +36,5 @@ Commit + push → CI reload caddy → cek `curl -sI https://myservice.asepharyan
 ## Deployment Model
 
 Repo `asepharyana/infra` TIDAK build aplikasi. Aplikasi deploy via repo masing-masing
-(`hub`, `scraper`, `tools`, `llm-api`) dengan `nix build → nix copy → nix-env --profile → systemctl restart`.
+(`hub`, `scraper`, `mcpedia`) dengan `nix build → nix copy → nix-env --profile → systemctl restart`.
 Repo ini hanya mengelola config yang di-sync manual/CI ke VPS.

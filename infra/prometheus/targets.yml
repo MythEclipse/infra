@@ -1,13 +1,15 @@
 # Nix service targets (file_sd) — 2026-08-02
 # Service yang expose /metrics langsung:
-- targets: ['127.0.0.1:4016']
+- targets: ['127.0.0.1:4018']
   labels:
     service: gmw-discord-gateway
-- targets: ['127.0.0.1:4008']
+# mcpedia (wiki) API: /metrics plain text di :4020
+- targets: ['127.0.0.1:4020']
   labels:
-    service: tools-gateway
+    service: mcpedia-api
 # GMW backend expose /api/metrics (bukan /metrics):
 - targets: ['127.0.0.1:4001']
   labels:
     service: gmw-backend
     __metrics_path__: /api/metrics
+# tools-gateway (:4008) dihapus 2026-10-01 — stack tools tidak ada lagi di prod.
