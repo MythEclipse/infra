@@ -76,7 +76,10 @@ jobs:
           set -e
           if [ -f infra/prometheus/targets.yml ]; then
             scp -q infra/prometheus/targets.yml "$VPS_USER@$VPS_HOST":/tmp/targets.yml
-            ssh "$VPS_USER@$VPS_HOST" "sudo cp /tmp/targets.yml /etc/prometheus/targets.yml 2>/dev/null && sudo rm -f /tmp/targets.yml && sudo systemctl reload prometheus 2>/dev/null || true"
+            # prometheus.yml loads file_sd from /var/lib/prometheus/targets.yml —
+            # writing to /etc/prometheus/ silently never takes effect.
+            ssh "$VPS_USER@$VPS_HOST" "sudo cp /tmp/targets.yml /var/lib/prometheus/targets.yml && sudo rm -f /tmp/targets.yml"
+            ssh "$VPS_USER@$VPS_HOST" "sudo systemctl reload prometheus 2>/dev/null || sudo systemctl restart prometheus"
             echo "✅ prometheus targets synced"
           else
             echo "no infra/prometheus/targets.yml"
