@@ -183,8 +183,12 @@ dev.asepharyana.my.id {
 # Hindsight API (self-hosted) — password-only gate via forward_auth.
 # Mirrors hindsight.imrnes.team: /login form (no username), 30-day sha256 cookie.
 # Gate = /home/code/opt/hindsight-gate/auth.py on 127.0.0.1:8891 (systemd: hindsight-gate).
-# forward_auth must NOT rewrite the URI: the gate's 302 Location is absolute
-# (built from GATE_PUBLIC_URL), so /login survives the subrequest intact.
+#
+# Why forward_auth carries an explicit `not path` matcher: the directive expands
+# into a catch-all handle block, and handle blocks are mutually exclusive. A
+# bare forward_auth plus a separate `handle /login` makes /login unreachable —
+# the catch-all wins and 302s to /login forever. Excluding the gate's own paths
+# from the matcher is the only ordering-independent fix.
 hindsight.asepharyana.my.id {
 	encode zstd gzip
 	header {
@@ -194,18 +198,15 @@ hindsight.asepharyana.my.id {
 		Referrer-Policy "strict-origin-when-cross-origin"
 	}
 
-	forward_auth 127.0.0.1:8891 {
-		uri /verify
-		copy_headers Authorization Cookie
+	@gate_paths path /login /logout
+	handle @gate_paths {
+		reverse_proxy 127.0.0.1:8891
 	}
 
-	# The gate's own login form + logout. Not behind forward_auth (that is the
-	# point — /login must be reachable while unauthenticated).
-	handle /login {
-		reverse_proxy 127.0.0.1:8891
-	}
-	handle /logout {
-		reverse_proxy 127.0.0.1:8891
+	@protected not path /login /logout
+	forward_auth @protected 127.0.0.1:8891 {
+		uri /verify
+		copy_headers Authorization Cookie
 	}
 
 	reverse_proxy 127.0.0.1:8890 {
