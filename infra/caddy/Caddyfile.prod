@@ -83,14 +83,6 @@ pr-agent.asepharyana.my.id {
 	import proxy 4023
 }
 
-lidm.asepharyana.my.id {
-	import proxy 4004
-}
-
-lidm-api.asepharyana.my.id {
-	import proxy 4005
-}
-
 zeavisedu.asepharyana.my.id {
 	import proxy 4011
 }
