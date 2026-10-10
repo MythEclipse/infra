@@ -1,18 +1,20 @@
+# Dependabot for asepharyana/infra.
+#
+# This repo holds ONLY infrastructure-as-code: Caddy configs, firewall scripts,
+# prometheus targets, systemd units. It has NO package.json, no lockfile and no
+# language manifests anywhere in the tree, so a `npm` entry can never resolve —
+# it failed daily with `/package.json not found`.
+#
+# The repo does consume GitHub Actions, so that is the only ecosystem kept here.
 version: 2
 updates:
-  - package-ecosystem: "npm"
+  - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "daily"
-    open-pull-requests-limit: 10
+      interval: "weekly"
     groups:
-      production:
-        dependency-type: "production"
-        update-types:
-          - "minor"
-          - "patch"
-      development:
-        dependency-type: "development"
+      actions:
+        patterns: ["*"]
         update-types:
           - "minor"
           - "patch"
