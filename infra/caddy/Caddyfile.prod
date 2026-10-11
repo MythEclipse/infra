@@ -47,12 +47,90 @@ dashboard.asepharyana.my.id {
 	import proxy 4013
 }
 
-imphnen.asepharyana.my.id {
-	import proxy 4009
-}
+# GMW dashboard. Caddy replaced nginx here: it was one more process doing
+# routing Caddy does natively, and it introduced a public door to the backend
+# (0.0.0.0:4009 answered /api/health from outside, bypassing TLS).
+#
+# Both names serve the SAME app — imphnen is an alias of gmw, verified by
+# comparing the served HTML, not an assumption — so they share one block.
+#
+# Route map, from the backend's own registrations:
+#   /api/*  REST        -> :4001   (app.use "/api/")
+#   /trpc/* oRPC (WS)   -> :4001   (app.all "/trpc/*")
+#   /ws     gateway/PCM -> :4001   (upgrade guard, startsWith "/ws")
+#   /       SPA shell   -> :4017   (serve.mjs, hashed assets + SPA fallback)
+#
+# The backend routes are matched with `handle` blocks rather than one
+# catch-all reverse_proxy, because handle blocks are mutually exclusive and are
+# evaluated in source order — so the specific prefixes must come before the
+# catch-all, exactly as the nginx `location` blocks did.
+imphnen.asepharyana.my.id, gmw.asepharyana.my.id {
+	encode zstd gzip
+	header {
+		-Server
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
 
-gmw.asepharyana.my.id {
-	import proxy 4009
+	# Hashed Vite assets are immutable for a year. The shell must revalidate or a
+	# deploy strands browsers on asset URLs that no longer exist — same split
+	# serve.mjs applies, so the SPA fallback keeps working either way.
+	@assets path /assets/*
+	handle @assets {
+		header Cache-Control "public, max-age=31536000, immutable"
+		reverse_proxy 127.0.0.1:4017
+	}
+
+	# Gateway events and the oRPC WebSocket both ride an Upgrade. `flush_interval
+	# -1` stops Caddy buffering a framed socket, which is what made the long-lived
+	# gateway connection drop through the old proxy.
+	@stream {
+		path /ws /ws/*
+		path /trpc /trpc/*
+	}
+	handle @stream {
+		reverse_proxy 127.0.0.1:4001 {
+			flush_interval -1
+			transport http {
+				keepalive 120s
+				max_conns_per_host 100
+				dial_timeout 3s
+				# The moderation worker streams and the gateway socket is
+				# long-lived; the shared 30s/60s defaults truncated both.
+				response_header_timeout 300s
+				read_timeout 300s
+				write_timeout 300s
+			}
+		}
+	}
+
+	handle /api/* {
+		reverse_proxy 127.0.0.1:4001 {
+			transport http {
+				keepalive 120s
+				max_conns_per_host 100
+				dial_timeout 3s
+				response_header_timeout 30s
+				read_timeout 60s
+				write_timeout 60s
+			}
+		}
+	}
+
+	# Everything else is the SPA.
+	handle {
+		reverse_proxy 127.0.0.1:4017 {
+			transport http {
+				keepalive 120s
+				max_conns_per_host 100
+				dial_timeout 3s
+				response_header_timeout 30s
+				read_timeout 60s
+				write_timeout 60s
+			}
+		}
+	}
 }
 
 scraper.asepharyana.my.id, api.asepharyana.my.id, scraper.asepharyana.web.id, api.asepharyana.web.id {
