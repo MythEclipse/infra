@@ -217,6 +217,17 @@ wiki.asepharyana.my.id {
 	handle /health {
 		reverse_proxy 127.0.0.1:4020
 	}
+	# better-auth. The SPA calls /api/auth/* (AUTH_BASE_PATH in
+	# apps/web/src/lib/auth-config.ts) and the API mounts app.all("/api/auth/*"),
+	# but this handle was missing: the request fell through to `import proxy 4016`
+	# and the SPA catch-all answered with index.html.
+	#
+	# It failed as a 200, not an error. The SPA parsed HTML as a failed sign-in, so
+	# a correct password reported "wrong password" with nothing in any log
+	# pointing at routing. Forward the full path unstripped, as /trpc/* below does.
+	handle /api/auth/* {
+		reverse_proxy 127.0.0.1:4020
+	}
 }
 mcpedia.asepharyana.my.id {
 	import proxy 4016
@@ -235,6 +246,17 @@ mcpedia.asepharyana.my.id {
 		reverse_proxy 127.0.0.1:4020
 	}
 	handle /health {
+		reverse_proxy 127.0.0.1:4020
+	}
+	# better-auth. The SPA calls /api/auth/* (AUTH_BASE_PATH in
+	# apps/web/src/lib/auth-config.ts) and the API mounts app.all("/api/auth/*"),
+	# but this handle was missing: the request fell through to `import proxy 4016`
+	# and the SPA catch-all answered with index.html.
+	#
+	# It failed as a 200, not an error. The SPA parsed HTML as a failed sign-in, so
+	# a correct password reported "wrong password" with nothing in any log
+	# pointing at routing. Forward the full path unstripped, as /trpc/* below does.
+	handle /api/auth/* {
 		reverse_proxy 127.0.0.1:4020
 	}
 }
