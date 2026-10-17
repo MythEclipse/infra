@@ -7,7 +7,9 @@ on:
       - 'infra/caddy/**'
       - 'infra/firewall/**'
       - 'infra/systemd/**'
+      - 'infra/scripts/**'
       - 'infra/prometheus/**'
+      - '.github/workflows/infra-deploy.yml'
   workflow_dispatch:
 
 concurrency:
@@ -34,6 +36,22 @@ jobs:
           chmod +x /tmp/caddy
           /tmp/caddy validate --config infra/caddy/Caddyfile.prod --adapter caddyfile 2>&1 | tail -5
           echo "✅ Caddyfile valid"
+
+      - name: Test host scripts
+        run: |
+          set -e
+          # Each script's own offline suite. Every external command is stubbed, so
+          # this needs no network, no Bitwarden and no credentials — it runs before
+          # anything is pushed to a host.
+          shopt -s nullglob
+          ran=0
+          for t in infra/tests/*-test.sh; do
+            echo "== $t"
+            bash "$t"
+            ran=$((ran + 1))
+          done
+          [[ "$ran" -gt 0 ]] || { echo "::error::no host-script tests found"; exit 1; }
+          echo "✅ host scripts tested"
 
       - name: Setup SSH key
         env:

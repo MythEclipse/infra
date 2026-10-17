@@ -1,0 +1,17 @@
+[Unit]
+Description=Run the GMW health watchdog every 5 minutes
+Documentation=man:systemd.timer(5)
+
+[Timer]
+# Every 5 min: fast enough that a revoked token is caught while you still
+# remember it, slow enough that the watchdog comfortably fits inside Bitwarden's
+# per-minute request budget alongside the box's other bws-exec units.
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+# Persistent=true so a reboot still runs a check shortly after boot, rather than
+# waiting out the full interval.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

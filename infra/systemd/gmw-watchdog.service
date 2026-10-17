@@ -1,0 +1,31 @@
+[Unit]
+Description=GMW health watchdog — alerts a Discord webhook when GMW degrades
+Documentation=man:systemd.service(5)
+After=network-online.target gmw-backend.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Secrets come from BWS via the same bws-exec wrapper the app itself uses, so
+# the watchdog reads exactly the same token the service runs on. bws-exec makes
+# ONE Bitwarden call and exports DISCORD_TOKEN, MONITOR_GUILD_ID and DATABASE_URL
+# into this process, which is why the script itself needs no fetch for them.
+#
+# That single call matters: resolving each value with its own `bws secret list`
+# (six per run) tripped Bitwarden's 500-requests/minute limiter, and the
+# resulting 429 was swallowed by `2>/dev/null` — so a rate limit was reported to
+# Discord as "gmw_discord_token could not be read from BWS", a false outage.
+ExecStart=/usr/local/bin/bws-exec gmw /usr/local/bin/gmw-watchdog.sh
+User=root
+Group=root
+
+# A watchdog that hangs must not pile up behind the timer.
+TimeoutStartSec=120
+
+# Never restart on failure — this is the thing reporting failures. Exit 1 means
+# "Bitwarden was unreachable, so I claimed nothing", which is deliberate: the
+# timer retries in 5 minutes rather than the watchdog inventing a fault.
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
