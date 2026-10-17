@@ -71,6 +71,52 @@ jobs:
             echo "no infra/systemd/ files"
           fi
 
+      - name: Sync host scripts to VPS
+        run: |
+          set -e
+          # Units in infra/systemd/ exec scripts from /usr/local/bin (the host's
+          # established convention — bws-exec, bws-env and the deploy scripts all
+          # live there). Without this step a unit ships and then fails at
+          # ExecStart with 203/EXEC, because the unit file was installed but the
+          # thing it runs never was.
+          if [ -d infra/scripts ]; then
+            for f in infra/scripts/*; do
+              [ -f "$f" ] || continue
+              base=$(basename "$f")
+              case "$base" in
+              *.sh) ;;
+              *)
+                echo "  skipping $base (not a .sh script)"
+                continue
+                ;;
+              esac
+              echo "  installing /usr/local/bin/$base"
+              scp -q "$f" "$VPS_USER@$VPS_HOST":/tmp/"$base"
+              ssh "$VPS_USER@$VPS_HOST" "sudo install -m 0755 /tmp/$base /usr/local/bin/$base && sudo rm -f /tmp/$base"
+            done
+            echo "✅ host scripts installed"
+          else
+            echo "no infra/scripts/ files"
+          fi
+
+      - name: Enable and start infra timers
+        run: |
+          set -e
+          # Installing a .timer does not arm it — `systemctl enable --now` is what
+          # writes the symlink and schedules the first run. A timer that exists but
+          # is not enabled looks correct in `systemctl list-unit-files` and never
+          # fires, which is the worst of both: it reads as deployed and does
+          # nothing.
+          for unit in infra/systemd/*.timer; do
+            [ -f "$unit" ] || continue
+            base=$(basename "$unit")
+            echo "  enabling $base"
+            ssh "$VPS_USER@$VPS_HOST" "sudo systemctl enable --now $base"
+            ssh "$VPS_USER@$VPS_HOST" "systemctl is-active $base"
+            ssh "$VPS_USER@$VPS_HOST" "systemctl list-timers $base --no-pager | head -2"
+          done
+          echo "✅ timers armed"
+
       - name: Sync prometheus targets to VPS
         run: |
           set -e

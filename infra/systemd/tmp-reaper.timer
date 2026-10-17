@@ -1,0 +1,26 @@
+[Unit]
+Description=Hourly /tmp reclaim on orangevps
+Documentation=https://github.com/asepharyana/infra
+# Deliberately NOT BindsTo/PartOf the services whose files it protects: the
+# reaper must keep the box healthy even while a deploy is mid-flight, and it
+# already refuses to touch anything in use.
+After=tmp-reaper.service
+
+[Timer]
+OnCalendar=hourly
+# /tmp here is a 7.8G RAM disk that filled to 100% and broke a deploy in
+# 2026-10-17. Hourly, not the 10d in systemd-tmpfiles' stock rule (which only
+# prunes on a calendar sweep and never touched the worker's clone dirs at all).
+# The 12h age floor inside the script is what actually decides eligibility, so a
+# short interval costs one cheap directory walk and keeps the ceiling low.
+#
+# Persistent is intentionally OFF. OnCalendar=hourly is already a coarse sweep and
+# a catch-up run after boot adds nothing: the box has been off, so /tmp is
+# (tmpfs) empty anyway — every entry there is by definition newer than the last
+# boot, and therefore younger than the 12h floor.
+RandomizedDelaySec=300
+AccuracySec=1min
+Unit=tmp-reaper.service
+
+[Install]
+WantedBy=timers.target

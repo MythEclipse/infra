@@ -1,0 +1,25 @@
+[Unit]
+Description=Reclaim /tmp on orangevps (tmpfs reaper)
+Documentation=https://github.com/asepharyana/infra
+# Runs as root because /tmp here holds entries owned by code, pr-agent, root and
+# postgres, and only root can traverse all of them. The reaper compensates with a
+# denylist-first design (see the script header): nothing whose name matches the
+# protected set is ever deleted, regardless of age or ownership.
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tmp-reaper.sh --apply
+# A reaper must never be the reason a unit is red. "Nothing to reclaim" is a
+# normal outcome on a healthy host, and a nonzero exit for the pnpm-store lock
+# would only teach the operator to ignore this unit — the same failure mode the
+# pr-agent worker's report-only arms were fixed for.
+SuccessExitStatus=0 1
+Nice=10
+IOSchedulingClass=idle
+# 15 minutes is generous for a directory walk; the reaper never blocks on
+# network or a build, so a run this long means something is badly wrong.
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target
