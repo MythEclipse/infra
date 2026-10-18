@@ -195,10 +195,20 @@ upload.asepharyana.my.id, upload.asepharyana.web.id {
 wiki.asepharyana.my.id {
 	import proxy 4016
 
-	# Phase 7: observability dashboard (public).
-	handle /dashboard {
-		reverse_proxy 127.0.0.1:4020
-	}
+	# NOTE: there is deliberately NO `handle /dashboard` here.
+	#
+	# It proxied /dashboard to the API on :4020, which served a self-contained
+	# HTML page naming the product, the protocol and BullMQ — the only branded
+	# surface left on a site that presents itself as a plain wiki, and invisible
+	# to every guard over apps/web/src because it lived in apps/api/src.
+	#
+	# That page is deleted (apps/api/src/no-service-html.test.ts keeps it gone)
+	# and /dashboard is now a WIKI page: the SPA's own "Site overview" route
+	# (apps/web/src/routes.tsx) — pages, sections, tags, recent edits and the
+	# queue strip. Falling through to `import proxy 4016` is what serves it, so
+	# re-adding a handle here would shadow the SPA and bring the branded page
+	# back as a 200.
+	#
 	# Phase 7: Prometheus metrics (public, safe to scrape).
 	handle /metrics {
 		reverse_proxy 127.0.0.1:4020
@@ -232,10 +242,9 @@ wiki.asepharyana.my.id {
 mcpedia.asepharyana.my.id {
 	import proxy 4016
 
-	# Alias mcpedia -> wiki (same app): observability/trpc/hooks/health routes.
-	handle /dashboard {
-		reverse_proxy 127.0.0.1:4020
-	}
+	# Alias mcpedia -> wiki (same app): trpc/hooks/health routes. No /dashboard
+	# handle, for the reason documented on the wiki block above — the SPA owns
+	# that URL now.
 	handle /metrics {
 		reverse_proxy 127.0.0.1:4020
 	}
