@@ -137,16 +137,62 @@ fi
 # Token and guild: the gateway check reads both from the backend's own report, so
 # no credential is fetched or transmitted here at all.
 
-notify() { # notify <emoji> <title> <lines...>
+# Human-readable duration: "42s", "4m 12s", "3h 07m", "2d 4h".
+human_duration() {
+  local s="${1:-0}"
+  if [[ "$s" -lt 60 ]]; then printf '%ds' "$s"
+  elif [[ "$s" -lt 3600 ]]; then printf '%dm %02ds' $((s / 60)) $((s % 60))
+  elif [[ "$s" -lt 86400 ]]; then printf '%dh %02dm' $((s / 3600)) $((s % 3600 / 60))
+  else printf '%dd %dh' $((s / 86400)) $((s % 86400 / 3600))
+  fi
+}
+
+send_content() { # send_content <content>
+  local payload
+  payload=$(jq -n --arg c "$1" '{content:$c, username:"GMW Watchdog"}')
+  curl -s -o /dev/null -m 20 -H 'Content-Type: application/json' -d "$payload" "$HOOK" ||
+    log "notify failed"
+}
+
+# One readable message: a bold headline, a bulleted list, one footer.
+#
+# The previous version wrapped EVERY problem in its own triple-backtick block,
+# which on a phone rendered as a column of grey slabs separated by blank lines —
+# the operator had to reassemble the alert by eye. A bullet list reads as what it
+# is: a short list of faults.
+#
+# Discord rejects content over 2000 characters with a 400 and the alert is simply
+# lost, so the list is chunked on problem boundaries rather than truncated. An
+# error message can be long; a silently dropped alert is worse than two messages.
+notify() { # notify <emoji> <title> <problem...>
+  local emoji="$1" title="$2"
+  shift 2
+  local header="**${emoji} ${title}**"
+  local footer
+  footer="$(hostname) · $(date '+%Y-%m-%d %H:%M %Z')"
+  local chunk="$header" line
+  for line in "$@"; do
+    # A problem is one line by contract; flatten anyway so a multi-line error
+    # from Discord cannot break the bullet layout.
+    line="${line//$'\n'/ }"
+    if ((${#chunk} + ${#line} + 8 > 1800)); then
+      send_content "$chunk"
+      chunk="$header (continued)"
+    fi
+    chunk="${chunk}"$'\n'"• ${line}"
+  done
+  send_content "${chunk}"$'\n\n'"${footer}"
+}
+
+# Recovery is prose, not a list. A single bulleted sentence ("• Degraded for
+# 4m 12s") reads like a fault that is still present; the all-clear should read
+# as a sentence.
+notify_plain() { # notify_plain <emoji> <title> <line...>
   local emoji="$1" title="$2"
   shift 2
   local body="**${emoji} ${title}**" line
-  for line in "$@"; do body="${body}\n\`\`\`\n${line}\n\`\`\`"; done
-  body="${body}\n\`host\` \`$(hostname)\` · \`$(date -Is)\`"
-  local payload
-  payload=$(jq -n --arg c "$body" '{content:$c, username:"GMW Watchdog"}')
-  curl -s -o /dev/null -m 20 -H 'Content-Type: application/json' -d "$payload" "$HOOK" ||
-    log "notify failed"
+  for line in "$@"; do body="${body}"$'\n'"${line}"; done
+  send_content "${body}"$'\n\n'"$(hostname) · $(date '+%Y-%m-%d %H:%M %Z')"
 }
 
 # --- checks ---------------------------------------------------------------
@@ -338,22 +384,44 @@ check_gateway
 check_backlog
 
 # --- dedup + dispatch -----------------------------------------------------
+# State is two lines: the fingerprint of the current failure set, and the epoch
+# second it was FIRST seen. The timestamp is what makes the recovery message
+# worth reading — "recovered" with no duration cannot tell a five-minute blip
+# from an all-night outage, and duration is the first thing anyone asks.
+#
+# A single-line state file is a pre-upgrade leftover; it is read as a fingerprint
+# with no known start time rather than discarded, so an alert that is currently
+# open still closes properly instead of re-firing.
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 fingerprint="$(printf '%s' "${problems[*]-}" | sha256sum | cut -c1-16)"
-previous="$(cat "$STATE" 2>/dev/null || echo none)"
+previous="none"
+previous_since=""
+if [[ -f "$STATE" ]]; then
+  previous="$(sed -n 1p "$STATE" 2>/dev/null)"
+  previous_since="$(sed -n 2p "$STATE" 2>/dev/null)"
+  previous="${previous:-none}"
+fi
 
 if [[ "${#problems[@]}" -gt 0 ]]; then
   log "ALERT(${problems[*]}): ${#problems[@]} problem(s)"
   if [[ "$fingerprint" != "$previous" ]]; then
     notify "🔴" "GMW DEGRADED — ${#problems[@]} problem(s)" "${problems[@]}"
-    printf '%s' "$fingerprint" >"$STATE"
+    printf '%s\n%s\n' "$fingerprint" "$(date +%s)" >"$STATE"
   fi
 else
   if [[ "$previous" != "none" ]]; then
-    notify "🟢" "GMW recovered — all checks pass"
+    # Say how long it was broken. The duration is measured from the first run
+    # that saw this failure, so it is a lower bound, not an exact outage window —
+    # the watchdog only observes once per timer tick.
+    if [[ "$previous_since" =~ ^[0-9]+$ ]]; then
+      notify_plain "🟢" "GMW recovered — all checks pass" \
+        "Degraded for **$(human_duration $(( $(date +%s) - previous_since )))** (since $(date -d "@${previous_since}" '+%H:%M %Z'))."
+    else
+      notify_plain "🟢" "GMW recovered — all checks pass"
+    fi
     log "RECOVERED"
   fi
-  printf 'none' >"$STATE"
+  printf 'none\n' >"$STATE"
   log "OK: all checks pass"
 fi
 

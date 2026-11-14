@@ -170,7 +170,11 @@ fresh() {
 reds() { grep -c '🔴' "$CAPTURE" 2>/dev/null || true; }
 greens() { grep -c '🟢' "$CAPTURE" 2>/dev/null || true; }
 calls() { cat "$WORK/bws-calls" 2>/dev/null || echo 0; }
-logcount() { grep -c "$1" "$WORK/log" 2>/dev/null || true; }
+# `grep -c` prints 0 AND exits 1 when nothing matches, so `grep -c ... || echo 0`
+# emits "0\n0" — which made the "no code fences" assertion fail while printing a
+# matching want=0. Count on one line, always.
+count_in() { grep -c -- "$1" "$2" 2>/dev/null | head -1 || true; }
+logcount() { count_in "$1" "$WORK/log"; }
 
 PASS=0 FAIL=0
 check() {
@@ -284,8 +288,8 @@ echo "=== backlog predicate mirrors claim_messages() ==="
 # The 33-message false alarm was a PREDICATE bug: soft-deleted rows are never
 # claimable, so counting them reports a stuck worker that does not exist.
 fresh; invoke "" "$(status_json)" 0
-check "excludes soft-deleted rows" 1 "$(grep -c 'deleted_at IS NULL' "$WORK/psql-sql" 2>/dev/null || echo 0)"
-check "excludes rows still in backoff" 1 "$(grep -c 'ready_for_work_at' "$WORK/psql-sql" 2>/dev/null || echo 0)"
+check "excludes soft-deleted rows" 1 "$(count_in 'deleted_at IS NULL' "$WORK/psql-sql")"
+check "excludes rows still in backoff" 1 "$(count_in 'ready_for_work_at' "$WORK/psql-sql")"
 
 echo "=== quiet guild, empty queue (the old overnight false RED) ==="
 fresh; invoke "" "$(status_json)" 0
@@ -299,6 +303,57 @@ done
 check "three degraded runs post ONE alert" 1 "$(reds)"
 invoke "" "$(status_json)"
 check "recovery posts one GREEN" 1 "$(greens)"
+check "recovery says how long it was down" 1 "$(count_in 'Degraded for' "$CAPTURE")"
+if [[ "${SHOW_MESSAGES:-0}" == "1" ]]; then
+  echo
+  echo "--- RECOVERY, as posted ---"
+  jq -r '.content' "$CAPTURE"
+  echo "--- end ---"
+fi
+
+echo "=== message renders as a bullet list, not a wall of code fences ==="
+# The old format wrapped each problem in its own triple-backtick block, which on
+# a phone was a column of grey slabs. Assert the shape, not just the text.
+fresh; invoke "" "$(status_json '.connected=false | .everReady=false | .uptimeMs=900000
+  | .state="idle"')" 7
+check "bullets, one per problem" 2 "$(grep -o '• ' "$CAPTURE" | wc -l | tr -d ' ')"
+check "no code fences" 0 "$(count_in '```' "$CAPTURE")"
+check "headline is bold" 1 "$(count_in '**🔴 GMW DEGRADED' "$CAPTURE")"
+# SHOW_MESSAGES=1 dumps the exact posted payloads, so the rendered Discord
+# message can be eyeballed without sending anything to a real webhook.
+if [[ "${SHOW_MESSAGES:-0}" == "1" ]]; then
+  echo
+  echo "--- DEGRADED alert, as posted ---"
+  jq -r '.content' "$CAPTURE"
+  echo "--- end ---"
+fi
+
+echo "=== a long error message is chunked, not dropped ==="
+# Discord rejects >2000 chars with a 400 and the alert vanishes. Two messages
+# beat a silently lost one.
+fresh; invoke "" "$(status_json ".connected=false | .everReady=false | .uptimeMs=900000
+  | .loginError=\"$(printf 'x%.0s' $(seq 1 2500))\"")"
+check "split into multiple messages" 1 "$(count_in 'continued' "$CAPTURE")"
+
+echo "=== state file survives a pre-upgrade single-line format ==="
+# An open alert written by the old version must still close, not re-fire.
+fresh; invoke "" "$(status_json '.connected=false | .everReady=false | .uptimeMs=900000 | .state="idle"')"
+printf '%s' "$(head -1 "$WORK/state/state")" >"$WORK/state/state"
+: >"$CAPTURE"
+invoke "" "$(status_json)"
+check "old-format state still recovers" 1 "$(greens)"
+check "no duplicate RED" 0 "$(reds)"
+
+# SHOW_MESSAGES=1 prints the exact payloads that were posted, so the rendered
+# Discord message can be eyeballed without sending anything to a real webhook.
+if [[ "${SHOW_MESSAGES:-0}" == "1" ]]; then
+  echo
+  echo "=== a DEGRADED alert, as posted ==="
+  grep '🔴' "$CAPTURE" | tail -1
+  echo
+  echo "=== the RECOVERY message, as posted ==="
+  grep '🟢' "$CAPTURE" | tail -1
+fi
 
 echo
 printf 'PASS=%s FAIL=%s\n' "$PASS" "$FAIL"
