@@ -7,14 +7,19 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 # Secrets come from BWS via the same bws-exec wrapper the app itself uses, so
-# the watchdog reads exactly the same token the service runs on. bws-exec makes
-# ONE Bitwarden call and exports DISCORD_TOKEN, MONITOR_GUILD_ID and DATABASE_URL
-# into this process, which is why the script itself needs no fetch for them.
+# the watchdog reads exactly the same environment the service runs on. bws-exec
+# makes ONE Bitwarden call and exports the gmw_* values into this process.
 #
 # That single call matters: resolving each value with its own `bws secret list`
 # (six per run) tripped Bitwarden's 500-requests/minute limiter, and the
 # resulting 429 was swallowed by `2>/dev/null` — so a rate limit was reported to
 # Discord as "gmw_discord_token could not be read from BWS", a false outage.
+#
+# The wrapper is now used ONLY for that environment. The Discord check no longer
+# needs DISCORD_TOKEN: it reads the backend's own account of its gateway session
+# from http://127.0.0.1:4001/api/discord/status, so no credential is used and no
+# request goes to discord.com. The webhook URL (not gmw_-prefixed, so not
+# exported) is the one secret the script still fetches itself.
 ExecStart=/usr/local/bin/bws-exec gmw /usr/local/bin/gmw-watchdog.sh
 User=root
 Group=root
