@@ -3,11 +3,47 @@
 #
 # WHAT THIS CATCHES (and why a plain `is-active` check does not):
 #   1. unit down / crash-looping
-#   2. Discord token revoked or invalid  <- invisible to is-active, because
-#      Restart=always keeps systemd "happy" while the process dies on every
-#      Discord login. Only probing /users/@me with the service's own token sees it.
+#   2. Discord gateway down, wedged, or refused at login
 #   3. backend HTTP not answering on :4001
 #   4. moderation queue not draining (rows piling up past their wait budget)
+#
+# ## Why there is no longer a `GET /users/@me` token probe
+#
+# This script used to verify the Discord credential from the OUTSIDE: every five
+# minutes it sent an authenticated REST call to discord.com with the account's
+# user token, and treated anything but HTTP 200 as "token revoked".
+#
+# That was wrong twice over.
+#
+# First, it is the signature of a selfbot. A datacenter IP issuing a bare
+# user-token REST call on a fixed timer, holding no gateway session, is exactly
+# what Discord's anti-abuse heuristics look for — the watchdog risked getting
+# banned the very account it was guarding. An operations check must not be
+# indistinguishable from the abuse it is supposed to be watching for.
+#
+# Second, it could not tell the two failures apart. HTTP 000 is a TRANSPORT
+# failure (DNS, TCP, TLS, timeout) — the request never reached Discord, so it
+# says nothing whatsoever about the token. The old code reported it as
+# "Token revoked or invalid. Fix: bws secret edit gmw_discord_token", which sent
+# an operator to rotate a perfectly good credential in response to a network
+# blip. The alert stream in the ops channel is full of exactly that.
+#
+# So the observation moved to where the credential lives. The backend already
+# holds an authenticated gateway connection; it publishes what that connection
+# is doing at `GET /api/discord/status` on loopback, and this script reads it.
+# No outbound request, no credential used, and a strictly better signal: a probe
+# tested whether a token *would* authenticate, this reports whether the session
+# *is* alive — including the cases a probe could never see, like a socket that
+# stays open while Discord has stopped talking to it.
+#
+# ## Reading a report is not the same as probing
+#
+# The gateway check therefore treats "I could not read the report" as UNKNOWN,
+# not as a fault. A refused connection, a timeout, a non-200, a body that is not
+# JSON — all mean this script is blind, and a blind run claims nothing. Only a
+# well-formed report describing a broken gateway produces a RED. That is the same
+# rule the Bitwarden fix below arrived at, applied to the other fetch in this
+# file.
 #
 # ONE BWS CALL, NOT SIX. This script used to resolve three secret IDs via three
 # `bws secret list` calls and then three `bws secret get` calls per run. `bws
@@ -16,12 +52,11 @@
 # 500-requests-per-minute limiter. A 429 was then swallowed by `2>/dev/null`,
 # leaving an empty variable that was misread as "the token is gone".
 #
-# The ordering below is the actual fix for that false alarm: the webhook AND
-# every value the checks need come out of the SAME atomic fetch. If Bitwarden is
-# unreachable the fetch fails as a whole, so the run reports "BWS unreachable"
-# and exits WITHOUT alerting — a BWS outage can no longer masquerade as a GMW
-# outage. When the two were fetched separately, a failed token read alongside a
-# successful webhook read produced a confident, wrong RED.
+# The token and guild reads are gone entirely now that the gateway is observed
+# from inside, so what is left is the ONE secret bws-exec cannot export (the
+# webhook is not gmw_-prefixed) and the ONE call that fetches it. If Bitwarden is
+# unreachable the fetch fails as a whole and the run exits WITHOUT alerting — a
+# BWS outage can no longer masquerade as a GMW outage.
 #
 # A retry loop is deliberately absent. `bws` has no retry flag, and a retry
 # without a wait is pointless, so a transient 429 costs one 5-minute cycle and
@@ -38,6 +73,8 @@ STATE="$STATE_DIR/state"
 LOG="${LOG:-/var/log/gmw-watchdog.log}"
 UNIT="${UNIT:-gmw-backend}"
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:4001/api/health}"
+# The backend's own account of its Discord session. Loopback only, always 200.
+STATUS_URL="${STATUS_URL:-http://127.0.0.1:4001/api/discord/status}"
 BWS_PROJECT="${BWS_PROJECT:-27210268-6134-47b3-9a68-b4980079d1ec}"
 BWS="${BWS:-/usr/local/bin/bws}"
 
@@ -47,15 +84,26 @@ BWS="${BWS:-/usr/local/bin/bws}"
 # dominated by how chatty the Discord server happens to be.
 BACKLOG_MINUTES=15
 
+# A restart legitimately spends a minute migrating, binding HTTP and logging in,
+# so "not connected yet" is not a fault until this window has passed.
+GATEWAY_BOOT_GRACE_SEC="${GATEWAY_BOOT_GRACE_SEC:-180}"
+# A reconnect is normal; a session that has been down this long is not.
+GATEWAY_DOWN_SEC="${GATEWAY_DOWN_SEC:-300}"
+# Discord heartbeats every ~41s and the library re-emits every frame, so a READY
+# client that has heard nothing for this long is wedged, not merely quiet.
+GATEWAY_SILENT_SEC="${GATEWAY_SILENT_SEC:-600}"
+# The guild cache fills in after the READY payload. Only complain about a missing
+# guild once the session has had time to settle.
+GATEWAY_GUILD_SETTLE_SEC="${GATEWAY_GUILD_SETTLE_SEC:-120}"
+
 WEBHOOK_KEY=pr_agent_discord_webhook_url
 
 log() { printf '%s %s\n' "$(date -Is)" "$*" >>"$LOG"; }
 
-# --- secrets: ONE fetch, shared by the webhook and the checks -------------
-# bws-exec exports the gmw_* secrets into this process already, so DISCORD_TOKEN
-# and MONITOR_GUILD_ID normally need no API call at all — and reading the token
-# from the environment is the most faithful possible check, since it is exactly
-# the value the service booted with.
+# Milliseconds since epoch, to compare against the report's epoch-ms stamps.
+now_ms() { date +%s%3N; }
+
+# --- secrets: ONE fetch, for the only value bws-exec cannot provide --------
 export BWS_ACCESS_TOKEN="${BWS_ACCESS_TOKEN:-$(tr -d '\r\n' </etc/bws-token 2>/dev/null || true)}"
 
 secrets_json=""
@@ -86,11 +134,8 @@ if ! HOOK="$(resolve_webhook)"; then
   exit 1
 fi
 
-# Token and guild: prefer bws-exec's environment, fall back to the fetch.
-TOKEN="${DISCORD_TOKEN:-}"
-[[ -n "$TOKEN" ]] || TOKEN="$(secret_value gmw_discord_token)"
-GUILD="${MONITOR_GUILD_ID:-}"
-[[ -n "$GUILD" ]] || GUILD="$(secret_value gmw_monitor_guild_id)"
+# Token and guild: the gateway check reads both from the backend's own report, so
+# no credential is fetched or transmitted here at all.
 
 notify() { # notify <emoji> <title> <lines...>
   local emoji="$1" title="$2"
@@ -130,43 +175,147 @@ check_http() {
     problems+=("backend health ${HEALTH_URL} -> HTTP ${code:-000}, expected 200")
 }
 
-check_discord() {
-  # A user token takes NO 'Bot ' prefix — the `Bot` scheme belongs to bot tokens
-  # and 401s against a user token regardless of whether that token is alive.
-  local me status who uid member_status
-  if [[ -z "$TOKEN" ]]; then
-    problems+=("DISCORD_TOKEN is empty (bws-exec env and Bitwarden both gave nothing)")
+# The gateway's own account of itself, read from loopback.
+#
+# Every branch below is a distinct, diagnosable fault with a distinct fix, which
+# is the point of reading a structured report instead of a status code: a
+# revoked token and a wedged socket both look like HTTP 200 from outside, and an
+# operator should not have to guess which one they have.
+check_gateway() {
+  local raw code body
+  raw="$(curl -s -m 10 -w '\n%{http_code}' "$STATUS_URL" 2>/dev/null)"
+  code="${raw##*$'\n'}"
+  body="${raw%$'\n'*}"
+
+  # Blind, not broken. See the header: an unreadable report is UNKNOWN.
+  if [[ "$code" != "200" ]]; then
+    log "SKIP: ${STATUS_URL} -> HTTP ${code:-000}; gateway unobservable, claiming nothing"
+    return
+  fi
+  if ! printf '%s' "$body" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    log "SKIP: ${STATUS_URL} returned no JSON object; gateway unobservable, claiming nothing"
     return
   fi
 
-  # Captured into a variable, never a /tmp file: a concurrent /tmp reaper or a
-  # leftover file from an earlier run made the JSON read fail, and the empty
-  # result was then reported as "account '' is not a member of guild".
-  # `-w '\n%{http_code}'` keeps the status and body in one round trip.
-  me="$(curl -s -m 20 -w '\n%{http_code}' -H "Authorization: $TOKEN" \
-    https://discord.com/api/v10/users/@me 2>/dev/null)"
-  status="${me##*$'\n'}"
-  me="${me%$'\n'*}"
-  if [[ "$status" != "200" ]]; then
-    problems+=("Discord token REJECTED — /users/@me -> HTTP ${status:-000}. Token revoked or invalid. Fix: bws secret edit gmw_discord_token, then systemctl restart gmw-backend")
+  # One jq pass, ONE VALUE PER LINE.
+  #
+  # Not `IFS=$'\t' read`: a tab is IFS *whitespace*, so consecutive tabs collapse
+  # and an empty field silently shifts every column after it. `loginError: ""`
+  # and `lastDisconnect: null` are both normal and both empty, so that read
+  # misparsed healthy reports — it reported `state=""` and the gateway check
+  # bailed out as unobservable, which reads exactly like a working SKIP.
+  #
+  # `mapfile` keeps empty elements, and the free-text fields have their tabs and
+  # newlines flattened first so one value can never span two lines.
+  local -a f
+  mapfile -t f < <(printf '%s' "$body" | jq -r '[
+      (.connected // false),
+      (.everReady // false),
+      (.invalidated // false),
+      ((.loginError // "") | tostring | gsub("[\\t\\n\\r]"; " ")),
+      (.uptimeMs // 0),
+      (.downSince // 0),
+      (.lastPacketAgoMs // -1),
+      (.readySince // 0),
+      (.lastDisconnect.code // 0),
+      ((.lastDisconnect.reason // "") | tostring | gsub("[\\t\\n\\r]"; " ")),
+      (.state // "unknown"),
+      ([.monitoredGuilds[]? | select(.present == false) | .id] | join(","))
+    ] | .[]' 2>/dev/null)
+
+  if [[ "${#f[@]}" -lt 12 ]]; then
+    log "SKIP: could not parse ${STATUS_URL}; gateway unobservable, claiming nothing"
     return
   fi
 
-  who="$(printf '%s' "$me" | jq -r '.username // "unknown"')"
-  uid="$(printf '%s' "$me" | jq -r '.id // ""')"
-  [[ -n "$GUILD" && -n "$uid" ]] || return
-  member_status="$(curl -s -o /dev/null -w '%{http_code}' -m 20 -H "Authorization: $TOKEN" \
-    "https://discord.com/api/v10/guilds/${GUILD}/members/${uid}" 2>/dev/null)"
-  [[ "$member_status" == "200" ]] ||
-    problems+=("account '${who}' is not a member of monitored guild ${GUILD} (HTTP ${member_status})")
+  local connected="${f[0]}" ever_ready="${f[1]}" invalidated="${f[2]}"
+  local login_error="${f[3]}" uptime_ms="${f[4]}" down_since="${f[5]}"
+  local packet_age_ms="${f[6]}" ready_since="${f[7]}" disconnect_code="${f[8]}"
+  local disconnect_reason="${f[9]}" state="${f[10]}" missing_guilds="${f[11]}"
+
+  # 1. The credential was rejected at startup. `loginError` is cleared on the
+  #    first successful ready, so a non-empty value is conclusive: the process is
+  #    up, the dashboard is up, and capture has never once started.
+  if [[ -n "$login_error" ]]; then
+    problems+=("Discord login FAILED — the stored token was rejected at startup and the gateway never connected (${login_error}). Fix: bws secret edit gmw_discord_token, then systemctl restart ${UNIT}")
+    return
+  fi
+
+  # 2. The library gave up re-identifying and destroyed its shards. Capture is
+  #    dead and only a restart recovers it.
+  if [[ "$invalidated" == "true" ]]; then
+    problems+=("Discord session INVALIDATED — the gateway could not re-identify and stopped, so nothing is captured. Fix: systemctl restart ${UNIT}")
+    return
+  fi
+
+  # 3. A close code that names the fault. 4004 is authentication failed; 4013 and
+  #    4014 are Discord refusing this client outright. None of these is a network
+  #    problem, and each is fatal to capture until something changes.
+  case "$disconnect_code" in
+    4004 | 4013 | 4014)
+      problems+=("Discord closed the gateway with ${disconnect_code} (${disconnect_reason:-no reason given}) — the token is rejected or the account is restricted. Fix: bws secret edit gmw_discord_token, then systemctl restart ${UNIT}")
+      return
+      ;;
+  esac
+
+  if [[ "$connected" != "true" ]]; then
+    if [[ "$ever_ready" != "true" ]]; then
+      # Never connected. Booting is not a fault; booting forever is.
+      if [[ "$uptime_ms" -lt $((GATEWAY_BOOT_GRACE_SEC * 1000)) ]]; then
+        log "gateway still starting (up ${uptime_ms}ms, state=${state})"
+      else
+        problems+=("Discord gateway NEVER connected — still '${state}' after $((uptime_ms / 60000)) min up, with no login error recorded. Check: journalctl -u ${UNIT} | grep -i 'login'")
+      fi
+    else
+      # Was connected, is not now. A short reconnect is normal.
+      local down_ms=0
+      [[ "$down_since" -gt 0 ]] && down_ms=$(( $(now_ms) - down_since ))
+      if [[ "$down_ms" -gt $((GATEWAY_DOWN_SEC * 1000)) ]]; then
+        problems+=("Discord gateway disconnected for $((down_ms / 60000)) min (state='${state}') — capture is stopped. Check: journalctl -u ${UNIT} | grep -i 'gateway\\|disconnect'")
+      else
+        log "gateway reconnecting (${down_ms}ms down, state=${state})"
+      fi
+    fi
+    return
+  fi
+
+  # 4. READY but silent. The socket is open and the library says connected, yet
+  #    Discord has sent nothing — not even the ~41s heartbeat — for ten minutes.
+  #    This is a wedged connection, and it is invisible to every other check here.
+  if [[ "$packet_age_ms" -ge 0 && "$packet_age_ms" -gt $((GATEWAY_SILENT_SEC * 1000)) ]]; then
+    problems+=("Discord gateway is READY but has received nothing for $((packet_age_ms / 60000)) min — the socket is open and dead, so capture has stopped. Fix: systemctl restart ${UNIT}")
+  fi
+
+  # 5. Logged in, but not in the guild it is supposed to moderate. Everything
+  #    looks healthy and nothing is captured. Only checked once the session has
+  #    settled, because the guild cache fills in after READY.
+  if [[ -n "$missing_guilds" && "$ready_since" -gt 0 ]]; then
+    local settled_ms=$(( $(now_ms) - ready_since ))
+    if [[ "$settled_ms" -gt $((GATEWAY_GUILD_SETTLE_SEC * 1000)) ]]; then
+      problems+=("account is not a member of monitored guild(s) ${missing_guilds} — nothing from them is captured")
+    fi
+  fi
 }
 
 # Queue depth, not journal volume. `message captured` lines only appear when the
 # server is chatty, so the old grep fired on every genuinely quiet stretch and
 # then "recovered" on its own the moment someone typed — six consecutive false
-# REDs in one overnight window. Rows sitting in the queue past their budget mean
-# the worker is stuck no matter how quiet the guild is, and an empty queue means
-# the pipeline is fine no matter how quiet the guild is.
+# REDs in one overnight window.
+#
+# The predicate mirrors `claim_messages()` EXACTLY, and that is the fix for the
+# other false alarm this check produced. It was missing `deleted_at IS NULL`, so
+# every message the account had deleted in Discord — which the worker correctly
+# never claims, because `claim_messages` filters them out — stayed counted as
+# backlog forever. Production sat at "33 message(s) queued for more than 15 min"
+# for hours with ZERO claimable rows: 34 soft-deleted messages, all unclaimable
+# by design, reported as a stuck worker every five minutes.
+#
+# `ready_for_work_at` is the second half of the same mistake: a row in backoff is
+# legitimately not claimable yet, and counting it turns normal retry behaviour
+# into an outage.
+#
+# So the count is now literally "rows `claim_messages` would pick, that nobody
+# has picked, for 15 minutes" — the only reading that means the worker is stuck.
 check_backlog() {
   local age_ms backlog
   [[ -n "${DATABASE_URL:-}" ]] || return
@@ -175,6 +324,8 @@ check_backlog() {
   backlog="$(psql "$DATABASE_URL" -tAc \
     "SELECT count(*) FROM messages
       WHERE ai_status IN ('pending','retry_wait')
+        AND deleted_at IS NULL
+        AND ready_for_work_at <= (extract(epoch FROM now()) * 1000)::bigint
         AND created_at < (extract(epoch FROM now()) * 1000 - ${age_ms})::bigint" 2>/dev/null)" || return
   [[ "$backlog" =~ ^[0-9]+$ ]] || return
   [[ "$backlog" -eq 0 ]] ||
@@ -183,7 +334,7 @@ check_backlog() {
 
 check_unit
 check_http
-check_discord
+check_gateway
 check_backlog
 
 # --- dedup + dispatch -----------------------------------------------------
@@ -206,4 +357,4 @@ else
   log "OK: all checks pass"
 fi
 
-unset TOKEN HOOK secrets_json
+unset HOOK secrets_json
